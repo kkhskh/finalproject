@@ -42,7 +42,16 @@ from transformers import AutoTokenizer
 def load_wikitext2(base_dir: str = "data/wikitext2"):
     """
     Load WikiText-2 from a local arrow dataset directory.
+    If not found, download and save it.
     """
+    import os
+    if not os.path.exists(base_dir) or not os.path.exists(os.path.join(base_dir, "train")):
+        print(f"Dataset not found at {base_dir}, downloading from HuggingFace...")
+        from datasets import load_dataset
+        dataset = load_dataset("wikitext", "wikitext-2-v1")
+        dataset.save_to_disk(base_dir)
+        print(f"Dataset saved to {base_dir}")
+        return dataset
     dataset = load_from_disk(base_dir)
     return dataset
 
