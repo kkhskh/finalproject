@@ -45,7 +45,10 @@ def load_wikitext2(base_dir: str = "data/wikitext2"):
     If not found, download and save it.
     """
     import os
-    if not os.path.exists(base_dir) or not os.path.exists(os.path.join(base_dir, "train")):
+    import glob
+    # Check if the actual data files exist, not just the directory structure
+    train_arrow = glob.glob(os.path.join(base_dir, "train", "*.arrow"))
+    if not os.path.exists(base_dir) or not train_arrow:
         print(f"Dataset not found at {base_dir}, downloading from HuggingFace...")
         from datasets import load_dataset
         dataset = load_dataset("wikitext", "wikitext-2-v1")
