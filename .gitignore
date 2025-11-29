@@ -1,0 +1,22 @@
+# Cache files
+*.arrow
+*.pyc
+__pycache__/
+
+# Model files (can be regenerated)
+*.pt
+
+# Dataset cache folders
+data/wikitext2/train/cache-*.arrow
+data/wikitext2/test/cache-*.arrow
+data/wikitext2/validation/cache-*.arrow
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+

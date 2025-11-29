@@ -1,0 +1,1390 @@
+#!/usr/bin/env python3
+"""
+CS242 Final Project — AlphaEvolve-style search + full training on WikiText-2.
+
+Modes:
+  --mode ea           : evolutionary search with short training to find good configs
+  --mode train_best   : load best_config.json and train it to convergence (more epochs)
+  --mode train_manual : train a hand-designed baseline transformer config
+
+Example usage:
+
+  # search
+  python 1.py --mode ea --ea_pop_size 4 --ea_generations 3 --ea_train_steps 100
+
+  # train best evolved config for 10 epochs
+  python 1.py --mode train_best --epochs 10
+
+  # train manual baseline for 10 epochs
+  python 1.py --mode train_manual --epochs 10
+"""
+
+import math
+import random
+import time
+from dataclasses import dataclass
+from typing import Literal
+
+import argparse
+import json
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from datasets import load_from_disk
+from torch.utils.data import DataLoader
+from transformers import AutoTokenizer
+
+# -----------------------------
+# Dataset utilities
+# -----------------------------
+
+def load_wikitext2(base_dir: str = "data/wikitext2"):
+    """
+    Load WikiText-2 from a local arrow dataset directory.
+    """
+    dataset = load_from_disk(base_dir)
+    return dataset
+
+
+def tokenize_wikitext2(raw_datasets, tokenizer, block_size: int):
+    """
+    Tokenize text with a GPT-2 tokenizer and group into fixed-length blocks.
+    Each block is of length block_size; labels are next-token targets.
+    """
+    block_size = min(block_size, tokenizer.model_max_length)
+
+    def tokenize_function(examples):
+        return tokenizer(examples["text"])
+
+    tokenized = raw_datasets.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=["text"],
+        desc="Tokenizing",
+    )
+
+    def group_texts(examples):
+        concatenated = {k: sum(examples[k], []) for k in examples.keys()}
+        total_length = len(concatenated["input_ids"])
+        if total_length >= block_size:
+            total_length = (total_length // block_size) * block_size
+        result = {}
+        for k, t in concatenated.items():
+            result[k] = [t[i:i + block_size] for i in range(0, total_length, block_size)]
+        # For LM, labels are just shifted input_ids (we shift in the loss)
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    lm_datasets = tokenized.map(
+        group_texts,
+        batched=True,
+        desc=f"Grouping into blocks of size {block_size}",
+    )
+    return lm_datasets
+
+
+def make_dataloaders(lm_datasets, batch_size: int):
+    """
+    Create PyTorch dataloaders from grouped LM dataset.
+    """
+    train_ds = lm_datasets["train"]
+    val_ds = lm_datasets["validation"]
+
+    train_ds.set_format(type="torch", columns=["input_ids"])
+    val_ds.set_format(type="torch", columns=["input_ids"])
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader
+
+
+# -----------------------------
+# Model: Transformer with configurable attention
+# -----------------------------
+
+class EvoMultiheadSelfAttention(nn.Module):
+    """
+    Multi-head self-attention with two algorithms:
+      - 'full': standard full causal attention over T
+      - 'chunked': local causal attention over chunks of size chunk_size
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        attention_type: Literal["full", "chunked"] = "full",
+        chunk_size: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        assert attention_type in ("full", "chunked")
+
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.attention_type = attention_type
+        self.chunk_size = chunk_size
+
+        self.dropout = nn.Dropout(dropout)
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        B, T, _ = x.size()
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # (B, T, H, D) -> (B, H, T, D)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        if self.attention_type == "full":
+            out = self._full_attention(q, k, v, causal)
+        else:
+            out = self._chunked_attention(q, k, v, causal)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        out = self.out_proj(out)
+        return out
+
+    def _full_attention(self, q, k, v, causal: bool):
+        B, H, T, D = q.size()
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
+        if causal:
+            mask = torch.triu(
+                torch.ones(T, T, device=scores.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            scores = scores.masked_fill(mask, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        return out
+
+    def _chunked_attention(self, q, k, v, causal: bool):
+        B, H, T, D = q.size()
+        chunk_size = min(self.chunk_size, T)
+        outputs = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            q_chunk = q[:, :, start:end, :]
+            k_chunk = k[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
+            Tc = end - start
+
+            scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) / math.sqrt(D)
+            if causal:
+                mask = torch.triu(
+                    torch.ones(Tc, Tc, device=scores.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(mask, float("-inf"))
+
+            attn = torch.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+            out_chunk = torch.matmul(attn, v_chunk)
+            outputs.append(out_chunk)
+
+        out = torch.cat(outputs, dim=2)  # (B, H, T, D)
+        return out
+
+
+class EvoTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        d_ff: int,
+        dropout: float,
+        attention_type: Literal["full", "chunked"],
+        chunk_size: int,
+    ):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.attn = EvoMultiheadSelfAttention(
+            d_model=d_model,
+            n_heads=n_heads,
+            attention_type=attention_type,
+            chunk_size=chunk_size,
+            dropout=dropout,
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class EvoTransformerLM(nn.Module):
+    """
+    GPT-like Transformer language model driven by EvoConfig.
+    """
+
+    def __init__(self, vocab_size: int, block_size: int, config: "EvoConfig"):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.block_size = block_size
+        self.config = config
+
+        self.token_embed = nn.Embedding(vocab_size, config.d_model)
+        self.pos_embed = nn.Embedding(block_size, config.d_model)
+        self.drop = nn.Dropout(config.dropout)
+
+        self.blocks = nn.ModuleList(
+            [
+                EvoTransformerBlock(
+                    d_model=config.d_model,
+                    n_heads=config.n_heads,
+                    d_ff=config.d_ff,
+                    dropout=config.dropout,
+                    attention_type=config.attention_type,
+                    chunk_size=config.chunk_size,
+                )
+                for _ in range(config.n_layers)
+            ]
+        )
+        self.ln_f = nn.LayerNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, vocab_size, bias=False)
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        B, T = idx.size()
+        if T > self.block_size:
+            idx = idx[:, -self.block_size :]
+            T = self.block_size
+
+        positions = torch.arange(0, T, device=idx.device, dtype=torch.long)
+        positions = positions.unsqueeze(0).expand(B, T)
+
+        x = self.token_embed(idx) + self.pos_embed(positions)
+        x = self.drop(x)
+
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        return logits
+
+
+# -----------------------------
+# Evolution config & search
+# -----------------------------
+
+@dataclass
+class EvoConfig:
+    d_model: int
+    n_heads: int
+    n_layers: int
+    d_ff: int
+    dropout: float
+    attention_type: Literal["full", "chunked"]
+    chunk_size: int
+    batch_size: int
+
+
+D_MODEL_CHOICES = [128, 192, 256]
+N_HEAD_CHOICES = [2, 4, 8]
+N_LAYER_CHOICES = [2, 3, 4]
+D_FF_CHOICES = [256, 384, 512]
+DROPOUT_CHOICES = [0.0, 0.1, 0.2]
+ATTN_TYPE_CHOICES = ["full", "chunked"]
+CHUNK_CHOICES = [16, 32, 64]
+BATCH_CHOICES = [8, 16, 32]
+
+
+def _sample_n_heads(d_model: int) -> int:
+    valid = [h for h in N_HEAD_CHOICES if d_model % h == 0]
+    return random.choice(valid)
+
+
+def random_config() -> EvoConfig:
+    d_model = random.choice(D_MODEL_CHOICES)
+    n_heads = _sample_n_heads(d_model)
+    return EvoConfig(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=random.choice(N_LAYER_CHOICES),
+        d_ff=random.choice(D_FF_CHOICES),
+        dropout=random.choice(DROPOUT_CHOICES),
+        attention_type=random.choice(ATTN_TYPE_CHOICES),
+        chunk_size=random.choice(CHUNK_CHOICES),
+        batch_size=random.choice(BATCH_CHOICES),
+    )
+
+
+def mutate(cfg: EvoConfig) -> EvoConfig:
+    new = EvoConfig(**cfg.__dict__)
+    field = random.choice(
+        [
+            "d_model",
+            "n_heads",
+            "n_layers",
+            "d_ff",
+            "dropout",
+            "attention_type",
+            "chunk_size",
+            "batch_size",
+        ]
+    )
+    if field == "d_model":
+        new.d_model = random.choice(D_MODEL_CHOICES)
+        new.n_heads = _sample_n_heads(new.d_model)
+    elif field == "n_heads":
+        new.n_heads = _sample_n_heads(new.d_model)
+    elif field == "n_layers":
+        new.n_layers = random.choice(N_LAYER_CHOICES)
+    elif field == "d_ff":
+        new.d_ff = random.choice(D_FF_CHOICES)
+    elif field == "dropout":
+        new.dropout = random.choice(DROPOUT_CHOICES)
+    elif field == "attention_type":
+        new.attention_type = random.choice(ATTN_TYPE_CHOICES)
+    elif field == "chunk_size":
+        new.chunk_size = random.choice(CHUNK_CHOICES)
+    elif field == "batch_size":
+        new.batch_size = random.choice(BATCH_CHOICES)
+    return new
+
+
+def crossover(a: EvoConfig, b: EvoConfig) -> EvoConfig:
+    d_model = random.choice([a.d_model, b.d_model])
+    n_heads = _sample_n_heads(d_model)
+    return EvoConfig(
+        d_model=d_model,
+        n_heads=n_heads,
+        n_layers=random.choice([a.n_layers, b.n_layers]),
+        d_ff=random.choice([a.d_ff, b.d_ff]),
+        dropout=random.choice([a.dropout, b.dropout]),
+        attention_type=random.choice([a.attention_type, b.attention_type]),
+        chunk_size=random.choice([a.chunk_size, b.chunk_size]),
+        batch_size=random.choice([a.batch_size, b.batch_size]),
+    )
+
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# -----------------------------
+# Short training for EA
+# -----------------------------
+
+# def train_and_eval_short(
+#     config: EvoConfig,
+#     lm_datasets,
+#     tokenizer,
+#     vocab_size: int,
+#     block_size: int,
+#     max_train_steps: int = 100,
+#     max_eval_batches: int = 40,
+# ):
+#     """
+#     Train a candidate model for a small number of steps and return:
+#       fitness, val_loss, perplexity, train_time, tokens_per_second
+#     """
+#     train_loader, val_loader = make_dataloaders(lm_datasets, config.batch_size)
+
+#     model = EvoTransformerLM(
+#         vocab_size=vocab_size, block_size=block_size, config=config
+#     ).to(device)
+#     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+#     pad_token_id = tokenizer.pad_token_id
+#     if pad_token_id is None:
+#         pad_token_id = (
+#             tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+#         )
+
+#     model.train()
+#     start_time = time.perf_counter()
+#     total_tokens = 0
+#     steps = 0
+
+#     for batch in train_loader:
+#         input_ids = batch["input_ids"].to(device)
+#         B, T = input_ids.size()
+
+#         if T > block_size:
+#             input_ids = input_ids[:, :block_size]
+#         elif T < block_size:
+#             pad_len = block_size - T
+#             pad = torch.full(
+#                 (B, pad_len), pad_token_id, device=device, dtype=input_ids.dtype
+#             )
+#             input_ids = torch.cat([input_ids, pad], dim=1)
+
+#         logits = model(input_ids)
+#         shift_logits = logits[:, :-1, :].contiguous()
+#         shift_labels = input_ids[:, 1:].contiguous()
+
+#         loss = F.cross_entropy(
+#             shift_logits.view(-1, vocab_size), shift_labels.view(-1)
+#         )
+
+#         optimizer.zero_grad()
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#         optimizer.step()
+
+#         total_tokens += input_ids.numel()
+#         steps += 1
+#         if steps >= max_train_steps:
+#             break
+
+#     train_time = time.perf_counter() - start_time
+#     tokens_per_second = total_tokens / max(train_time, 1e-6)
+
+#     # Validation
+#     model.eval()
+#     total_loss = 0.0
+#     total_eval_tokens = 0
+#     with torch.no_grad():
+#         for i, batch in enumerate(val_loader):
+#             input_ids = batch["input_ids"].to(device)
+#             B, T = input_ids.size()
+
+#             if T > block_size:
+#                 input_ids = input_ids[:, :block_size]
+#             elif T < block_size:
+#                 pad_len = block_size - T
+#                 pad = torch.full(
+#                     (B, pad_len),
+#                     pad_token_id,
+#                     device=device,
+#                     dtype=input_ids.dtype,
+#                 )
+#                 input_ids = torch.cat([input_ids, pad], dim=1)
+
+#             logits = model(input_ids)
+#             shift_logits = logits[:, :-1, :].contiguous()
+#             shift_labels = input_ids[:, 1:].contiguous()
+
+#             loss = F.cross_entropy(
+#                 shift_logits.view(-1, vocab_size),
+#                 shift_labels.view(-1),
+#                 reduction="sum",
+#             )
+#             total_loss += loss.item()
+#             total_eval_tokens += shift_labels.numel()
+
+#             if i + 1 >= max_eval_batches:
+#                 break
+
+#     val_loss = total_loss / max(total_eval_tokens, 1)
+#     perplexity = math.exp(min(val_loss, 20.0))
+
+#     # Fitness: lower loss and lower time are better
+#     time_penalty_weight = 0.0005
+#     fitness = -val_loss - time_penalty_weight * train_time
+
+#     return fitness, val_loss, perplexity, train_time, tokens_per_second
+
+
+def train_and_eval_short(
+    config: EvoConfig,
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int,
+    max_train_steps: int = 100,
+    max_eval_batches: int = 40,
+):
+    """
+    Train a candidate model for a small number of steps and return:
+      fitness, val_loss, perplexity, train_time, tokens_per_second, num_params
+    """
+    train_loader, val_loader = make_dataloaders(lm_datasets, config.batch_size)
+
+    model = EvoTransformerLM(
+        vocab_size=vocab_size,
+        block_size=block_size,
+        config=config,
+    ).to(device)
+
+    # Count parameters once
+    num_params = sum(p.numel() for p in model.parameters())
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=3e-4,
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
+    )
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = tokenizer.eos_token_id
+
+    model.train()
+    start_time = time.perf_counter()
+    total_tokens = 0
+    steps = 0
+
+    for batch in train_loader:
+        input_ids = batch["input_ids"].to(device)
+        B, T = input_ids.size()
+
+        if T > block_size:
+            input_ids = input_ids[:, :block_size]
+        elif T < block_size:
+            pad_len = block_size - T
+            pad = torch.full(
+                (B, pad_len),
+                pad_token_id,
+                device=device,
+                dtype=input_ids.dtype,
+            )
+            input_ids = torch.cat([input_ids, pad], dim=1)
+
+        logits = model(input_ids)
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+
+        loss = F.cross_entropy(
+            shift_logits.view(-1, vocab_size),
+            shift_labels.view(-1),
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        total_tokens += input_ids.numel()
+        steps += 1
+        if steps >= max_train_steps:
+            break
+
+    train_time = time.perf_counter() - start_time
+    tokens_per_second = total_tokens / max(train_time, 1e-6)
+
+    # Validation
+    model.eval()
+    total_loss = 0.0
+    total_eval_tokens = 0
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            input_ids = batch["input_ids"].to(device)
+            B, T = input_ids.size()
+
+            if T > block_size:
+                input_ids = input_ids[:, :block_size]
+            elif T < block_size:
+                pad_len = block_size - T
+                pad = torch.full(
+                    (B, pad_len),
+                    pad_token_id,
+                    device=device,
+                    dtype=input_ids.dtype,
+                )
+                input_ids = torch.cat([input_ids, pad], dim=1)
+
+            logits = model(input_ids)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+                reduction="sum",
+            )
+            total_loss += loss.item()
+            total_eval_tokens += shift_labels.numel()
+
+            if i + 1 >= max_eval_batches:
+                break
+
+    val_loss = total_loss / max(total_eval_tokens, 1)
+    perplexity = math.exp(min(val_loss, 20.0))
+
+    # Keep scalar fitness for logging if you want
+    time_penalty_weight = 0.0005
+    fitness = -val_loss - time_penalty_weight * train_time
+
+    return fitness, val_loss, perplexity, train_time, tokens_per_second, num_params
+
+
+# def train_and_eval_short(
+#     config: EvoConfig,
+#     lm_datasets,
+#     tokenizer,
+#     vocab_size: int,
+#     block_size: int,
+#     max_train_steps: int = 100,
+#     max_eval_batches: int = 40,
+# ):
+#     """
+#     Train a candidate model for a small number of steps and return:
+#       fitness, val_loss, perplexity, train_time, tokens_per_second, num_params
+#     """
+#     train_loader, val_loader = make_dataloaders(lm_datasets, config.batch_size)
+
+#     model = EvoTransformerLM(
+#         vocab_size=vocab_size, block_size=block_size, config=config
+#     ).to(device)
+
+#     # Count trainable parameters (for analysis / Pareto plots)
+#     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+#     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+
+#     pad_token_id = tokenizer.pad_token_id
+#     if pad_token_id is None:
+#         pad_token_id = (
+#             tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+#         )
+
+#     model.train()
+#     start_time = time.perf_counter()
+#     total_tokens = 0
+#     steps = 0
+
+#     for batch in train_loader:
+#         input_ids = batch["input_ids"].to(device)
+#         B, T = input_ids.size()
+
+#         if T > block_size:
+#             input_ids = input_ids[:, :block_size]
+#         elif T < block_size:
+#             pad_len = block_size - T
+#             pad = torch.full(
+#                 (B, pad_len), pad_token_id, device=device, dtype=input_ids.dtype
+#             )
+#             input_ids = torch.cat([input_ids, pad], dim=1)
+
+#         logits = model(input_ids)
+#         shift_logits = logits[:, :-1, :].contiguous()
+#         shift_labels = input_ids[:, 1:].contiguous()
+
+#         loss = F.cross_entropy(
+#             shift_logits.view(-1, vocab_size), shift_labels.view(-1)
+#         )
+
+#         optimizer.zero_grad()
+#         loss.backward()
+#         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+#         optimizer.step()
+
+#         total_tokens += input_ids.numel()
+#         steps += 1
+#         if steps >= max_train_steps:
+#             break
+
+#     train_time = time.perf_counter() - start_time
+#     tokens_per_second = total_tokens / max(train_time, 1e-6)
+
+#     # Validation
+#     model.eval()
+#     total_loss = 0.0
+#     total_eval_tokens = 0
+#     with torch.no_grad():
+#         for i, batch in enumerate(val_loader):
+#             input_ids = batch["input_ids"].to(device)
+#             B, T = input_ids.size()
+
+#             if T > block_size:
+#                 input_ids = input_ids[:, :block_size]
+#             elif T < block_size:
+#                 pad_len = block_size - T
+#                 pad = torch.full(
+#                     (B, pad_len),
+#                     pad_token_id,
+#                     device=device,
+#                     dtype=input_ids.dtype,
+#                 )
+#                 input_ids = torch.cat([input_ids, pad], dim=1)
+
+#             logits = model(input_ids)
+#             shift_logits = logits[:, :-1, :].contiguous()
+#             shift_labels = input_ids[:, 1:].contiguous()
+
+#             loss = F.cross_entropy(
+#                 shift_logits.view(-1, vocab_size),
+#                 shift_labels.view(-1),
+#                 reduction="sum",
+#             )
+#             total_loss += loss.item()
+#             total_eval_tokens += shift_labels.numel()
+
+#             if i + 1 >= max_eval_batches:
+#                 break
+
+#     val_loss = total_loss / max(total_eval_tokens, 1)
+#     perplexity = math.exp(min(val_loss, 20.0))
+
+#     # Fitness: lower loss and lower time are better
+#     time_penalty_weight = 0.0005
+#     fitness = -val_loss - time_penalty_weight * train_time
+
+#     return fitness, val_loss, perplexity, train_time, tokens_per_second, num_params
+
+def dominates(a, b):
+    """
+    Return True if candidate a Pareto-dominates candidate b
+    on (val_loss, tokens_per_second).
+    Lower loss is better, higher tokens/s is better.
+    """
+    better_or_equal_loss = a["val_loss"] <= b["val_loss"]
+    better_or_equal_speed = a["tokens_per_second"] >= b["tokens_per_second"]
+    strictly_better = (
+        a["val_loss"] < b["val_loss"]
+        or a["tokens_per_second"] > b["tokens_per_second"]
+    )
+    return better_or_equal_loss and better_or_equal_speed and strictly_better
+
+
+def evolutionary_search(
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int = 128,
+    pop_size: int = 4,
+    generations: int = 3,
+    max_train_steps: int = 100,
+    max_eval_batches: int = 40,
+):
+    population = [random_config() for _ in range(pop_size)]
+    history = []
+    global_best = None
+    ea_log_path = "ea_candidates.jsonl"
+
+    # overwrite log file each run
+    with open(ea_log_path, "w") as f_log:
+        total_ea_start = time.perf_counter()
+
+        for gen in range(generations):
+            print(f"\n=== Generation {gen} ===")
+            scored = []
+            gen_records = []
+
+            for idx, cfg in enumerate(population):
+                print(f"\nEvaluating individual {idx} with config: {cfg}")
+                (
+                    fitness,
+                    val_loss,
+                    ppl,
+                    train_time,
+                    tps,
+                    num_params,
+                ) = train_and_eval_short(
+                    cfg,
+                    lm_datasets,
+                    tokenizer,
+                    vocab_size,
+                    block_size,
+                    max_train_steps=max_train_steps,
+                    max_eval_batches=max_eval_batches,
+                )
+
+                scored.append(
+                    (fitness, cfg, val_loss, ppl, train_time, tps, num_params)
+                )
+
+                rec = {
+                    "search_type": "ea",
+                    "generation": gen,
+                    "index": idx,
+                    "config": cfg.__dict__,
+                    "fitness": float(fitness),
+                    "val_loss": float(val_loss),
+                    "perplexity": float(ppl),
+                    "train_time": float(train_time),
+                    "tokens_per_second": float(tps),
+                    "num_params": int(num_params),
+                }
+                gen_records.append(rec)
+                f_log.write(json.dumps(rec) + "\n")
+
+                print(
+                    f"  -> fitness={fitness:.4f} | val_loss={val_loss:.4f} "
+                    f"| ppl={ppl:.2f} | train_time={train_time:.1f}s "
+                    f"| tokens/s={tps:.1f} | params={num_params}"
+                )
+
+            # pick best by val_loss for reporting
+            scored.sort(key=lambda x: x[2])  # sort by val_loss
+            (
+                best_f,
+                best_cfg,
+                best_loss,
+                best_ppl,
+                best_time,
+                best_tps,
+                best_params,
+            ) = scored[0]
+
+            total_ea_time = time.perf_counter() - total_ea_start
+
+            history.append(
+                {
+                    "generation": gen,
+                    "config": best_cfg.__dict__,
+                    "fitness": float(best_f),
+                    "val_loss": float(best_loss),
+                    "perplexity": float(best_ppl),
+                    "train_time": float(best_time),
+                    "tokens_per_second": float(best_tps),
+                    "num_params": int(best_params),
+                    "ea_total_time": float(total_ea_time),
+                }
+            )
+
+            if (global_best is None) or (best_loss < global_best["val_loss"]):
+                global_best = history[-1]
+
+            print(
+                f"\n>>> Best in generation {gen}: {best_cfg}\n"
+                f"    fitness={best_f:.4f}, val_loss={best_loss:.4f}, "
+                f"ppl={best_ppl:.2f}, train_time={best_time:.1f}s, "
+                f"tokens/s={best_tps:.1f}, params={best_params}"
+            )
+
+            # PARETO SELECTION on (val_loss, tokens_per_second)
+            # Build simple record list for Pareto
+            pareto_records = []
+            for (fitness, cfg, val_loss, ppl, train_time, tps, num_params) in scored:
+                pareto_records.append(
+                    {
+                        "cfg": cfg,
+                        "val_loss": float(val_loss),
+                        "tokens_per_second": float(tps),
+                        "num_params": int(num_params),
+                    }
+                )
+
+            pareto_indices = []
+            for i, a in enumerate(pareto_records):
+                dominated = False
+                for j, b in enumerate(pareto_records):
+                    if i == j:
+                        continue
+                    if dominates(b, a):
+                        dominated = True
+                        break
+                if not dominated:
+                    pareto_indices.append(i)
+
+            parents = [pareto_records[i]["cfg"] for i in pareto_indices]
+
+            # fallback if too few parents
+            if len(parents) < 2:
+                parents = [cfg for (_, cfg, *_rest) in scored[: max(2, pop_size // 2)]]
+
+            # Reproduce
+            new_population = []
+            while len(new_population) < pop_size:
+                a, b = random.sample(parents, 2)
+                child = crossover(a, b)
+                if random.random() < 0.3:
+                    child = mutate(child)
+                new_population.append(child)
+
+            population = new_population
+
+    # attach total EA runtime to global_best for convenience
+    if global_best is not None:
+        global_best["ea_total_time"] = float(total_ea_time)
+
+    return history, global_best
+
+
+
+# def evolutionary_search(
+#     lm_datasets,
+#     tokenizer,
+#     vocab_size: int,
+#     block_size: int = 128,
+#     pop_size: int = 4,
+#     generations: int = 3,
+#     max_train_steps: int = 100,
+#     max_eval_batches: int = 40,
+# ):
+#     """
+#     Evolutionary search over EvoConfig space.
+
+#     Logs every evaluated candidate to ea_candidates.jsonl
+#     and stores total EA runtime in the returned global_best record
+#     under key 'ea_total_time'.
+#     """
+#     population = [random_config() for _ in range(pop_size)]
+#     history = []
+#     global_best = None
+
+#     ea_start = time.perf_counter()
+
+#     with open("ea_candidates.jsonl", "w") as log_f:
+#         for gen in range(generations):
+#             print(f"\n=== Generation {gen} ===")
+#             scored = []
+
+#             for idx, cfg in enumerate(population):
+#                 print(f"\nEvaluating individual {idx} with config: {cfg}")
+#                 (
+#                     fitness,
+#                     val_loss,
+#                     ppl,
+#                     train_time,
+#                     tps,
+#                     num_params,
+#                 ) = train_and_eval_short(
+#                     cfg,
+#                     lm_datasets,
+#                     tokenizer,
+#                     vocab_size,
+#                     block_size,
+#                     max_train_steps=max_train_steps,
+#                     max_eval_batches=max_eval_batches,
+#                 )
+
+#                 # Log this candidate for later analysis / Pareto front
+#                 record = {
+#                     "search_type": "ea",
+#                     "generation": gen,
+#                     "individual": idx,
+#                     "config": cfg.__dict__,
+#                     "fitness": fitness,
+#                     "val_loss": val_loss,
+#                     "perplexity": ppl,
+#                     "train_time": train_time,
+#                     "tokens_per_second": tps,
+#                     "num_params": num_params,
+#                 }
+#                 log_f.write(json.dumps(record) + "\n")
+#                 log_f.flush()
+
+#                 scored.append(
+#                     (fitness, cfg, val_loss, ppl, train_time, tps, num_params)
+#                 )
+#                 print(
+#                     f"  -> fitness={fitness:.4f} | val_loss={val_loss:.4f} "
+#                     f"| ppl={ppl:.2f} | train_time={train_time:.1f}s "
+#                     f"| tokens/s={tps:.1f} | params={num_params}"
+#                 )
+
+#             scored.sort(key=lambda x: x[0], reverse=True)
+#             best_f, best_cfg, best_loss, best_ppl, best_time, best_tps, best_params = scored[0]
+
+#             history.append(
+#                 {
+#                     "generation": gen,
+#                     "config": best_cfg.__dict__,
+#                     "fitness": best_f,
+#                     "val_loss": best_loss,
+#                     "perplexity": best_ppl,
+#                     "train_time": best_time,
+#                     "tokens_per_second": best_tps,
+#                     "num_params": best_params,
+#                 }
+#             )
+
+#             if (global_best is None) or (best_loss < global_best["val_loss"]):
+#                 global_best = history[-1]
+
+#             print(
+#                 f"\n>>> Best in generation {gen}: {best_cfg}\n"
+#                 f"    fitness={best_f:.4f}, val_loss={best_loss:.4f}, "
+#                 f"ppl={best_ppl:.2f}, train_time={best_time:.1f}s, "
+#                 f"tokens/s={best_tps:.1f}, params={best_params}"
+#             )
+
+#             # Selection + reproduction
+#             num_parents = max(2, pop_size // 2)
+#             parents = [cfg for (_, cfg, *_rest) in scored[:num_parents]]
+
+#             new_population = []
+#             while len(new_population) < pop_size:
+#                 a, b = random.sample(parents, 2)
+#                 child = crossover(a, b)
+#                 if random.random() < 0.3:
+#                     child = mutate(child)
+#                 new_population.append(child)
+#             population = new_population
+
+#     total_ea_time = time.perf_counter() - ea_start
+#     print(f"\nTotal EA runtime: {total_ea_time:.1f}s")
+
+#     if global_best is not None:
+#         global_best["ea_total_time"] = total_ea_time
+
+#     return history, global_best
+
+
+def random_search(
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int = 128,
+    num_candidates: int = 12,
+    max_train_steps: int = 100,
+    max_eval_batches: int = 40,
+):
+    """
+    Random search baseline: samples num_candidates random configs
+    from EvoConfig space, with the same short training budget used by EA.
+
+    Logs every candidate to random_candidates.jsonl and returns
+    (history, global_best) where global_best has key 'search_total_time'.
+    """
+    history = []
+    global_best = None
+
+    search_start = time.perf_counter()
+
+    with open("random_candidates.jsonl", "w") as log_f:
+        for idx in range(num_candidates):
+            cfg = random_config()
+            print(f"\n[Random] Evaluating candidate {idx} with config: {cfg}")
+            (
+                fitness,
+                val_loss,
+                ppl,
+                train_time,
+                tps,
+                num_params,
+            ) = train_and_eval_short(
+                cfg,
+                lm_datasets,
+                tokenizer,
+                vocab_size,
+                block_size,
+                max_train_steps=max_train_steps,
+                max_eval_batches=max_eval_batches,
+            )
+
+            record = {
+                "search_type": "random",
+                "candidate": idx,
+                "config": cfg.__dict__,
+                "fitness": fitness,
+                "val_loss": val_loss,
+                "perplexity": ppl,
+                "train_time": train_time,
+                "tokens_per_second": tps,
+                "num_params": num_params,
+            }
+            log_f.write(json.dumps(record) + "\n")
+            log_f.flush()
+
+            history.append(record)
+            print(
+                f"  -> fitness={fitness:.4f} | val_loss={val_loss:.4f} "
+                f"| ppl={ppl:.2f} | train_time={train_time:.1f}s "
+                f"| tokens/s={tps:.1f} | params={num_params}"
+            )
+
+            if (global_best is None) or (val_loss < global_best["val_loss"]):
+                global_best = record
+
+    total_time = time.perf_counter() - search_start
+    print(f"\nTotal random-search runtime: {total_time:.1f}s")
+
+    if global_best is not None:
+        global_best["search_total_time"] = total_time
+
+    return history, global_best
+
+
+
+
+# -----------------------------
+# Full training for a given config
+# -----------------------------
+
+def train_full(
+    config: EvoConfig,
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int,
+    epochs: int = 10,
+    lr: float = 3e-4,
+    max_grad_norm: float = 1.0,
+):
+    """
+    Train a given config for multiple epochs over the full training set.
+    Returns (best_val_loss, best_val_ppl, best_state_dict).
+    """
+    train_loader, val_loader = make_dataloaders(lm_datasets, config.batch_size)
+
+    model = EvoTransformerLM(
+        vocab_size=vocab_size, block_size=block_size, config=config
+    ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    pad_token_id = tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = (
+            tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+        )
+
+    train_ds = lm_datasets["train"]
+    tokens_per_epoch = len(train_ds) * block_size
+    print(f"Approx tokens/epoch: {tokens_per_epoch}")
+
+    best_val_loss = float("inf")
+    best_state = None
+
+    for epoch in range(1, epochs + 1):
+        model.train()
+        start = time.perf_counter()
+        total_loss = 0.0
+        total_tokens = 0
+
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            B, T = input_ids.size()
+
+            if T > block_size:
+                input_ids = input_ids[:, :block_size]
+            elif T < block_size:
+                pad_len = block_size - T
+                pad = torch.full(
+                    (B, pad_len),
+                    pad_token_id,
+                    device=device,
+                    dtype=input_ids.dtype,
+                )
+                input_ids = torch.cat([input_ids, pad], dim=1)
+
+            logits = model(input_ids)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
+
+            total_loss += loss.item() * shift_labels.numel()
+            total_tokens += shift_labels.numel()
+
+        scheduler.step()
+        train_time = time.perf_counter() - start
+        train_loss = total_loss / max(total_tokens, 1)
+        train_ppl = math.exp(min(train_loss, 20.0))
+
+        # Validation
+        model.eval()
+        val_loss_total = 0.0
+        val_tokens = 0
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch["input_ids"].to(device)
+                B, T = input_ids.size()
+
+                if T > block_size:
+                    input_ids = input_ids[:, :block_size]
+                elif T < block_size:
+                    pad_len = block_size - T
+                    pad = torch.full(
+                        (B, pad_len),
+                        pad_token_id,
+                        device=device,
+                        dtype=input_ids.dtype,
+                    )
+                    input_ids = torch.cat([input_ids, pad], dim=1)
+
+                logits = model(input_ids)
+                shift_logits = logits[:, :-1, :].contiguous()
+                shift_labels = input_ids[:, 1:].contiguous()
+
+                loss = F.cross_entropy(
+                    shift_logits.view(-1, vocab_size),
+                    shift_labels.view(-1),
+                    reduction="sum",
+                )
+                val_loss_total += loss.item()
+                val_tokens += shift_labels.numel()
+
+        val_loss = val_loss_total / max(val_tokens, 1)
+        val_ppl = math.exp(min(val_loss, 20.0))
+        tokens_per_sec = total_tokens / max(train_time, 1e-6)
+
+        print(
+            f"Epoch {epoch}/{epochs} | train_loss={train_loss:.4f} "
+            f"(ppl={train_ppl:.2f}) | val_loss={val_loss:.4f} "
+            f"(ppl={val_ppl:.2f}) | time={train_time:.1f}s | "
+            f"tokens/s={tokens_per_sec:.1f} | "
+            f"lr={scheduler.get_last_lr()[0]:.2e}"
+        )
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_state = model.state_dict()
+
+    return best_val_loss, math.exp(min(best_val_loss, 20.0)), best_state
+
+
+# -----------------------------
+# Config save/load
+# -----------------------------
+
+def save_best_config(path: str, best_record: dict):
+    cfg = best_record["config"]
+    obj = {
+        "config": cfg,
+        "val_loss": best_record["val_loss"],
+        "perplexity": best_record["perplexity"],
+    }
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+
+def load_config_from_json(path: str) -> EvoConfig:
+    with open(path, "r") as f:
+        obj = json.load(f)
+    cfg = obj["config"]
+    return EvoConfig(**cfg)
+
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        type=str,
+        default="ea",
+        choices=["ea", "random", "train_best", "train_manual"],
+        help="ea = evolutionary search; random = random search baseline; "
+             "train_best = train evolved config; train_manual = train baseline config",
+    )
+
+    parser.add_argument("--block_size", type=int, default=128)
+    parser.add_argument("--ea_pop_size", type=int, default=4)
+    parser.add_argument("--ea_generations", type=int, default=3)
+    parser.add_argument("--ea_train_steps", type=int, default=100)
+    parser.add_argument("--ea_eval_batches", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--config_json", type=str, default="best_config.json")
+    args = parser.parse_args()
+
+    random.seed(0)
+    torch.manual_seed(0)
+
+    base_dir = "data/wikitext2"
+    print(f"Loading WikiText-2 from {base_dir} ...")
+    raw_datasets = load_wikitext2(base_dir)
+
+    print("Loading tokenizer (GPT-2)...")
+    tokenizer = AutoTokenizer.from_pretrained("gpt2")
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+
+    print("Tokenizing + grouping dataset...")
+    lm_datasets = tokenize_wikitext2(raw_datasets, tokenizer, block_size=args.block_size)
+
+    vocab_size = len(tokenizer)
+    print(f"Vocab size: {vocab_size}")
+
+    if args.mode == "ea":
+        print("Running evolutionary search (short training)...")
+        history, global_best = evolutionary_search(
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            pop_size=args.ea_pop_size,
+            generations=args.ea_generations,
+            max_train_steps=args.ea_train_steps,
+            max_eval_batches=args.ea_eval_batches,
+        )
+        print("\nBest over all generations:")
+        print(global_best)
+        save_best_config(args.config_json, global_best)
+        print(f"\nSaved best config to {args.config_json}")
+
+    elif args.mode == "random":
+        print("Running random search baseline (short training)...")
+        history, global_best = random_search(
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            num_candidates=args.ea_pop_size * args.ea_generations,
+            max_train_steps=args.ea_train_steps,
+            max_eval_batches=args.ea_eval_batches,
+        )
+        print("\nBest over all random-search candidates:")
+        print(global_best)
+        save_best_config("best_random_config.json", global_best)
+        print("\nSaved best random-search config to best_random_config.json")
+
+    elif args.mode == "train_best":
+        print(f"Loading best config from {args.config_json}")
+        cfg = load_config_from_json(args.config_json)
+        print(f"Best config: {cfg}")
+        best_val_loss, best_ppl, best_state = train_full(
+            cfg,
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            epochs=args.epochs,
+        )
+        # Save evolved model checkpoint
+        torch.save(
+            {
+                "config": cfg.__dict__,
+                "state_dict": best_state,
+            },
+            "evolved_best_model.pt",
+        )
+        print(f"\nFinal best val_loss={best_val_loss:.4f}, ppl={best_ppl:.2f}")
+        print("Saved evolved model to evolved_best_model.pt")
+
+    elif args.mode == "train_manual":
+        print("Training manual baseline config...")
+        cfg = EvoConfig(
+            d_model=256,
+            n_heads=4,
+            n_layers=4,
+            d_ff=512,
+            dropout=0.2,
+            attention_type="full",
+            chunk_size=32,
+            batch_size=16,
+        )
+        print(f"Manual baseline config: {cfg}")
+        best_val_loss, best_ppl, best_state = train_full(
+            cfg,
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            epochs=args.epochs,
+        )
+        # Save baseline model checkpoint
+        torch.save(
+            {
+                "config": cfg.__dict__,
+                "state_dict": best_state,
+            },
+            "baseline_model.pt",
+        )
+        print(f"\nFinal baseline val_loss={best_val_loss:.4f}, ppl={best_ppl:.2f}")
+        print("Saved baseline model to baseline_model.pt")
+
+
+if __name__ == "__main__":
+    main()
