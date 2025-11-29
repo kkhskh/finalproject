@@ -1,0 +1,39 @@
+name: Train Models
+
+on:
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+    
+    - name: Train with best config
+      run: |
+        python 1.py --mode train_best --epochs 10 --config_json best_config.json
+    
+    - name: Train manual
+      run: |
+        python 1.py --mode train_manual --epochs 10
+    
+    - name: Upload results
+      uses: actions/upload-artifact@v3
+      with:
+        name: training-results
+        path: |
+          *.pt
+          *.json
+          *.png
+
