@@ -115,36 +115,73 @@ def make_dataloaders(lm_datasets, batch_size: int):
 # Model: Transformer with configurable attention
 # -----------------------------
 
+# class EvoMultiheadSelfAttention(nn.Module):
+#     """
+#     Multi-head self-attention with two algorithms:
+#       - 'full': standard full causal attention over T
+#       - 'chunked': local causal attention over chunks of size chunk_size
+#     """
+
+#     def __init__(
+#         self,
+#         d_model: int,
+#         n_heads: int,
+#         attention_type: Literal["full", "chunked"] = "full",
+#         chunk_size: int = 64,
+#         dropout: float = 0.1,
+#     ):
+#         super().__init__()
+#         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
+#         assert attention_type in ("full", "chunked")
+
+#         self.d_model = d_model
+#         self.n_heads = n_heads
+#         self.head_dim = d_model // n_heads
+#         self.attention_type = attention_type
+#         self.chunk_size = chunk_size
+
+#         self.dropout = nn.Dropout(dropout)
+#         self.q_proj = nn.Linear(d_model, d_model)
+#         self.k_proj = nn.Linear(d_model, d_model)
+#         self.v_proj = nn.Linear(d_model, d_model)
+#         self.out_proj = nn.Linear(d_model, d_model)
+
 class EvoMultiheadSelfAttention(nn.Module):
     """
-    Multi-head self-attention with two algorithms:
+    Multi-head self-attention with three algorithms:
       - 'full': standard full causal attention over T
       - 'chunked': local causal attention over chunks of size chunk_size
+      - 'hybrid': learned gate between full and chunked attention
     """
 
     def __init__(
         self,
         d_model: int,
         n_heads: int,
-        attention_type: Literal["full", "chunked"] = "full",
+        attention_type: Literal["full", "chunked", "hybrid"] = "full",
         chunk_size: int = 64,
         dropout: float = 0.1,
     ):
         super().__init__()
-        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
-        assert attention_type in ("full", "chunked")
-
         self.d_model = d_model
         self.n_heads = n_heads
         self.head_dim = d_model // n_heads
+        assert d_model % n_heads == 0
+
+        assert attention_type in ("full", "chunked", "hybrid")
         self.attention_type = attention_type
         self.chunk_size = chunk_size
 
-        self.dropout = nn.Dropout(dropout)
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        if self.attention_type == "hybrid":
+            # Learned scalar gate per layer: sigma(g) ~ how much to trust full attention
+            self.hybrid_gate = nn.Parameter(torch.tensor(0.0))
+
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         B, T, _ = x.size()
@@ -157,10 +194,20 @@ class EvoMultiheadSelfAttention(nn.Module):
         k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
 
+        # if self.attention_type == "full":
+        #     out = self._full_attention(q, k, v, causal)
+        # else:
+        #     out = self._chunked_attention(q, k, v, causal)
         if self.attention_type == "full":
             out = self._full_attention(q, k, v, causal)
-        else:
+        elif self.attention_type == "chunked":
             out = self._chunked_attention(q, k, v, causal)
+        else:  # 'hybrid'
+            full_out = self._full_attention(q, k, v, causal)
+            chunk_out = self._chunked_attention(q, k, v, causal)
+            gate = torch.sigmoid(self.hybrid_gate)  # scalar in (0,1)
+            out = gate * full_out + (1.0 - gate) * chunk_out
+
 
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         out = self.out_proj(out)
@@ -215,7 +262,7 @@ class EvoTransformerBlock(nn.Module):
         n_heads: int,
         d_ff: int,
         dropout: float,
-        attention_type: Literal["full", "chunked"],
+        attention_type: Literal["full", "chunked", "hybrid"],
         chunk_size: int,
     ):
         super().__init__()
@@ -303,9 +350,19 @@ class EvoConfig:
     n_layers: int
     d_ff: int
     dropout: float
-    attention_type: Literal["full", "chunked"]
+    attention_type: Literal["full", "chunked", "hybrid"]
     chunk_size: int
     batch_size: int
+
+# class EvoConfig:
+#     d_model: int
+#     n_heads: int
+#     n_layers: int
+#     d_ff: int
+#     dropout: float
+#     attention_type: Literal["full", "chunked"]
+#     chunk_size: int
+#     batch_size: int
 
 
 D_MODEL_CHOICES = [128, 192, 256]
@@ -313,7 +370,9 @@ N_HEAD_CHOICES = [2, 4, 8]
 N_LAYER_CHOICES = [2, 3, 4]
 D_FF_CHOICES = [256, 384, 512]
 DROPOUT_CHOICES = [0.0, 0.1, 0.2]
-ATTN_TYPE_CHOICES = ["full", "chunked"]
+ATTN_TYPE_CHOICES = ["full", "chunked", "hybrid"]
+
+# ATTN_TYPE_CHOICES = ["full", "chunked"]
 CHUNK_CHOICES = [16, 32, 64]
 BATCH_CHOICES = [8, 16, 32]
 
