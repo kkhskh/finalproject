@@ -1,0 +1,178 @@
+
+You are an expert in efficient Transformer attention for small language models.
+
+Below is the current PyTorch implementation of the EvoMultiheadSelfAttention class
+used in our WikiText-2 language model. It already supports three attention types:
+'full', 'chunked', and 'hybrid' (where 'hybrid' uses a learned gate between full and
+chunked attention).
+
+```python
+class EvoMultiheadSelfAttention(nn.Module):
+    """
+    Multi-head self-attention with three algorithms:
+      - 'full': standard full causal attention over T
+      - 'chunked': local causal attention over chunks of size chunk_size
+      - 'hybrid': learned gate between full and chunked attention
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        attention_type: Literal["full", "chunked", "hybrid"] = "full",
+        chunk_size: int = 64,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        assert d_model % n_heads == 0
+
+        assert attention_type in ("full", "chunked", "hybrid")
+        self.attention_type = attention_type
+        self.chunk_size = chunk_size
+
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        if self.attention_type == "hybrid":
+            # Learned scalar gate per layer: sigma(g) ~ how much to trust full attention
+            self.hybrid_gate = nn.Parameter(torch.tensor(0.0))
+
+
+    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        B, T, _ = x.size()
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        # (B, T, H, D) -> (B, H, T, D)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # if self.attention_type == "full":
+        #     out = self._full_attention(q, k, v, causal)
+        # else:
+        #     out = self._chunked_attention(q, k, v, causal)
+        if self.attention_type == "full":
+            out = self._full_attention(q, k, v, causal)
+        elif self.attention_type == "chunked":
+            out = self._chunked_attention(q, k, v, causal)
+        else:  # 'hybrid'
+            full_out = self._full_attention(q, k, v, causal)
+            chunk_out = self._chunked_attention(q, k, v, causal)
+            gate = torch.sigmoid(self.hybrid_gate)  # scalar in (0,1)
+            out = gate * full_out + (1.0 - gate) * chunk_out
+
+
+        out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
+        out = self.out_proj(out)
+        return out
+
+    def _full_attention(self, q, k, v, causal: bool):
+        B, H, T, D = q.size()
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(D)
+        if causal:
+            mask = torch.triu(
+                torch.ones(T, T, device=scores.device, dtype=torch.bool),
+                diagonal=1,
+            )
+            scores = scores.masked_fill(mask, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        return out
+
+    def _chunked_attention(self, q, k, v, causal: bool):
+        B, H, T, D = q.size()
+        chunk_size = min(self.chunk_size, T)
+        outputs = []
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            q_chunk = q[:, :, start:end, :]
+            k_chunk = k[:, :, start:end, :]
+            v_chunk = v[:, :, start:end, :]
+            Tc = end - start
+
+            scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) / math.sqrt(D)
+            if causal:
+                mask = torch.triu(
+                    torch.ones(Tc, Tc, device=scores.device, dtype=torch.bool),
+                    diagonal=1,
+                )
+                scores = scores.masked_fill(mask, float("-inf"))
+
+            attn = torch.softmax(scores, dim=-1)
+            attn = self.dropout(attn)
+            out_chunk = torch.matmul(attn, v_chunk)
+            outputs.append(out_chunk)
+
+        out = torch.cat(outputs, dim=2)  # (B, H, T, D)
+        return out
+
+
+```
+
+Here is a JSON summary of the best configurations found by our evolutionary search
+and random search under a short 100-step training budget:
+
+{
+  "ea_best": {
+    "config": {
+      "d_model": 256,
+      "n_heads": 2,
+      "n_layers": 4,
+      "d_ff": 384,
+      "dropout": 0.1,
+      "attention_type": "full",
+      "chunk_size": 32,
+      "batch_size": 16
+    },
+    "val_loss": 6.024454300046906,
+    "perplexity": 413.4159793760268
+  },
+  "random_best": {
+    "config": {
+      "d_model": 256,
+      "n_heads": 2,
+      "n_layers": 4,
+      "d_ff": 384,
+      "dropout": 0.1,
+      "attention_type": "full",
+      "chunk_size": 64,
+      "batch_size": 16
+    },
+    "val_loss": 6.018856547197958,
+    "perplexity": 411.1082439918741
+  }
+}
+
+Task:
+Propose an improved version of the EvoMultiheadSelfAttention class that keeps the
+same public API but changes the internal attention computation to better trade off
+validation loss (perplexity) vs training throughput (tokens/second) on small language models.
+
+Constraints:
+
+- Keep the class name exactly: EvoMultiheadSelfAttention
+
+- Keep the init signature and forward signature exactly the same.
+
+- The module must remain causal and compatible with existing code that calls it
+  (same shapes, same return type).
+
+- You may change the internal implementation of 'full', 'chunked', and/or
+  'hybrid' attention, or add additional internal tricks (e.g., different sparsity
+  pattern, better chunking scheme, gating structure, etc.), as long as the external
+  behavior is compatible.
+
+- The code must be valid PyTorch code (Python 3) with no placeholder ellipses.
+
+Return ONLY the complete updated class definition for EvoMultiheadSelfAttention,
+from the 'class' line down to the end of the class body.
+
