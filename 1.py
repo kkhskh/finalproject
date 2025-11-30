@@ -848,14 +848,13 @@ def evolutionary_search(
     generations: int = 3,
     max_train_steps: int = 100,
     max_eval_batches: int = 40,
+    log_path: str = "ea_candidates.jsonl",
 ):
     population = [random_config() for _ in range(pop_size)]
     history = []
     global_best = None
-    ea_log_path = "ea_candidates.jsonl"
-
     # overwrite log file each run
-    with open(ea_log_path, "w") as f_log:
+    with open(log_path, "w") as f_log:
         total_ea_start = time.perf_counter()
 
         for gen in range(generations):
@@ -1123,6 +1122,7 @@ def random_search(
     num_candidates: int = 12,
     max_train_steps: int = 100,
     max_eval_batches: int = 40,
+    log_path: str = "random_candidates.jsonl",
 ):
     """
     Random search baseline: samples num_candidates random configs
@@ -1136,7 +1136,7 @@ def random_search(
 
     search_start = time.perf_counter()
 
-    with open("random_candidates.jsonl", "w") as log_f:
+    with open(log_path, "w") as log_f:
         for idx in range(num_candidates):
             cfg = random_config()
             print(f"\n[Random] Evaluating candidate {idx} with config: {cfg}")
@@ -1401,6 +1401,10 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
+    log_suffix = args.dataset
+    ea_log_path = f"ea_candidates_{log_suffix}.jsonl"
+    random_log_path = f"random_candidates_{log_suffix}.jsonl"
+
     print("Tokenizing + grouping dataset...")
     lm_datasets = tokenize_wikitext2(raw_datasets, tokenizer, block_size=args.block_size)
 
@@ -1418,6 +1422,7 @@ def main():
             generations=args.ea_generations,
             max_train_steps=args.ea_train_steps,
             max_eval_batches=args.ea_eval_batches,
+            log_path=ea_log_path,
         )
         print("\nBest over all generations:")
         print(global_best)
@@ -1434,6 +1439,7 @@ def main():
             num_candidates=args.ea_pop_size * args.ea_generations,
             max_train_steps=args.ea_train_steps,
             max_eval_batches=args.ea_eval_batches,
+            log_path=random_log_path,
         )
         print("\nBest over all random-search candidates:")
         print(global_best)
