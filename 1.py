@@ -59,6 +59,28 @@ def load_wikitext2(base_dir: str = "data/wikitext2"):
     return dataset
 
 
+def load_wikitext103(base_dir: str = "data/wikitext103"):
+    """
+    Load WikiText-103 from disk if present; otherwise download from HuggingFace
+    and save to `base_dir`.
+
+    Returns a DatasetDict with 'train', 'validation', 'test' splits.
+    """
+    import os
+    import glob
+    # Check if the actual data files exist, not just the directory structure
+    train_arrow = glob.glob(os.path.join(base_dir, "train", "*.arrow"))
+    if not os.path.exists(base_dir) or not train_arrow:
+        print(f"Dataset not found at {base_dir}, downloading WikiText-103 from HuggingFace...")
+        from datasets import load_dataset
+        ds = load_dataset("wikitext", "wikitext-103-v1")
+        ds.save_to_disk(base_dir)
+        print(f"Dataset saved to {base_dir}")
+        return ds
+    print(f"Found WikiText-103 on disk at {base_dir}, loading...")
+    return load_from_disk(base_dir)
+
+
 def tokenize_wikitext2(raw_datasets, tokenizer, block_size: int):
     """
     Tokenize text with a GPT-2 tokenizer and group into fixed-length blocks.
@@ -1340,7 +1362,13 @@ def main():
         help="ea = evolutionary search; random = random search baseline; "
              "train_best = train evolved config; train_manual = train baseline config",
     )
-
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="wt2",
+        choices=["wt2", "wt103"],
+        help="wt2 = WikiText-2, wt103 = WikiText-103",
+    )
     parser.add_argument("--block_size", type=int, default=128)
     parser.add_argument("--ea_pop_size", type=int, default=4)
     parser.add_argument("--ea_generations", type=int, default=3)
@@ -1353,9 +1381,20 @@ def main():
     random.seed(0)
     torch.manual_seed(0)
 
-    base_dir = "data/wikitext2"
-    print(f"Loading WikiText-2 from {base_dir} ...")
-    raw_datasets = load_wikitext2(base_dir)
+    # base_dir = "data/wikitext2"
+    # print(f"Loading WikiText-2 from {base_dir} ...")
+    # raw_datasets = load_wikitext2(base_dir)
+    # Choose dataset
+    if args.dataset == "wt2":
+        base_dir = "data/wikitext2"
+        print(f"Loading WikiText-2 from {base_dir} ...")
+        raw_datasets = load_wikitext2(base_dir)
+    elif args.dataset == "wt103":
+        base_dir = "data/wikitext103"
+        print(f"Loading WikiText-103 from {base_dir} ...")
+        raw_datasets = load_wikitext103(base_dir)
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}")
 
     print("Loading tokenizer (GPT-2)...")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
