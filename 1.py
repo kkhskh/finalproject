@@ -850,9 +850,38 @@ def evolutionary_search(
     max_eval_batches: int = 40,
     log_path: str = "ea_candidates.jsonl",
 ):
-    population = [random_config() for _ in range(pop_size)]
+    """
+    Evolutionary search over EvoConfig space.
+
+    This version logs:
+      - arch_id: unique integer ID for each architecture
+      - parent_ids: list of parent arch_ids (empty for gen-0)
+      - created_via: "init", "crossover", "crossover+mutate"
+
+    Every evaluated candidate is written to `log_path` as one JSON line.
+    The returned `global_best` also carries `arch_id` and `ea_total_time`.
+    """
+    # --- initial population + lineage meta ---
+    population = []
+    population_meta = []   # parallel to population
+    next_arch_id = 0
+
+    for _ in range(pop_size):
+        cfg = random_config()
+        population.append(cfg)
+        population_meta.append(
+            {
+                "arch_id": next_arch_id,
+                "parent_ids": [],
+                "generation": 0,
+                "created_via": "init",
+            }
+        )
+        next_arch_id += 1
+
     history = []
     global_best = None
+
     # overwrite log file each run
     with open(log_path, "w") as f_log:
         total_ea_start = time.perf_counter()
@@ -860,9 +889,11 @@ def evolutionary_search(
         for gen in range(generations):
             print(f"\n=== Generation {gen} ===")
             scored = []
-            gen_records = []
 
-            for idx, cfg in enumerate(population):
+            # map config object -> meta (for parent lookup later)
+            cfg_to_meta = {id(cfg): meta for cfg, meta in zip(population, population_meta)}
+
+            for idx, (cfg, meta) in enumerate(zip(population, population_meta)):
                 print(f"\nEvaluating individual {idx} with config: {cfg}")
                 (
                     fitness,
@@ -889,6 +920,9 @@ def evolutionary_search(
                     "search_type": "ea",
                     "generation": gen,
                     "index": idx,
+                    "arch_id": meta["arch_id"],
+                    "parent_ids": meta["parent_ids"],
+                    "created_via": meta["created_via"],
                     "config": cfg.__dict__,
                     "fitness": float(fitness),
                     "val_loss": float(val_loss),
@@ -897,7 +931,6 @@ def evolutionary_search(
                     "tokens_per_second": float(tps),
                     "num_params": int(num_params),
                 }
-                gen_records.append(rec)
                 f_log.write(json.dumps(rec) + "\n")
 
                 print(
@@ -917,12 +950,14 @@ def evolutionary_search(
                 best_tps,
                 best_params,
             ) = scored[0]
+            best_meta = cfg_to_meta[id(best_cfg)]
 
             total_ea_time = time.perf_counter() - total_ea_start
 
             history.append(
                 {
                     "generation": gen,
+                    "arch_id": best_meta["arch_id"],
                     "config": best_cfg.__dict__,
                     "fitness": float(best_f),
                     "val_loss": float(best_loss),
@@ -941,11 +976,11 @@ def evolutionary_search(
                 f"\n>>> Best in generation {gen}: {best_cfg}\n"
                 f"    fitness={best_f:.4f}, val_loss={best_loss:.4f}, "
                 f"ppl={best_ppl:.2f}, train_time={best_time:.1f}s, "
-                f"tokens/s={best_tps:.1f}, params={best_params}"
+                f"tokens/s={best_tps:.1f}, params={best_params}, "
+                f"arch_id={best_meta['arch_id']}"
             )
 
-            # PARETO SELECTION on (val_loss, tokens_per_second)
-            # Build simple record list for Pareto
+            # ---------- Pareto SELECTION on (val_loss, tokens_per_second) ----------
             pareto_records = []
             for (fitness, cfg, val_loss, ppl, train_time, tps, num_params) in scored:
                 pareto_records.append(
@@ -969,28 +1004,50 @@ def evolutionary_search(
                 if not dominated:
                     pareto_indices.append(i)
 
-            parents = [pareto_records[i]["cfg"] for i in pareto_indices]
+            parents_cfgs = [pareto_records[i]["cfg"] for i in pareto_indices]
 
             # fallback if too few parents
-            if len(parents) < 2:
-                parents = [cfg for (_, cfg, *_rest) in scored[: max(2, pop_size // 2)]]
+            if len(parents_cfgs) < 2:
+                parents_cfgs = [
+                    cfg for (_, cfg, *_rest) in scored[: max(2, pop_size // 2)]
+                ]
 
-            # Reproduce
+            # ---------- Reproduce next generation + lineage meta ----------
             new_population = []
+            new_population_meta = []
+
             while len(new_population) < pop_size:
-                a, b = random.sample(parents, 2)
+                a, b = random.sample(parents_cfgs, 2)
+                meta_a = cfg_to_meta[id(a)]
+                meta_b = cfg_to_meta[id(b)]
+
                 child = crossover(a, b)
+                created_via = "crossover"
+
                 if random.random() < 0.3:
                     child = mutate(child)
+                    created_via = "crossover+mutate"
+
+                child_meta = {
+                    "arch_id": next_arch_id,
+                    "parent_ids": [meta_a["arch_id"], meta_b["arch_id"]],
+                    "generation": gen + 1,
+                    "created_via": created_via,
+                }
+                next_arch_id += 1
+
                 new_population.append(child)
+                new_population_meta.append(child_meta)
 
             population = new_population
+            population_meta = new_population_meta
 
     # attach total EA runtime to global_best for convenience
     if global_best is not None:
         global_best["ea_total_time"] = float(total_ea_time)
 
     return history, global_best
+
 
 
 
@@ -1191,6 +1248,236 @@ def random_search(
 
 
 
+def full_eval_from_log(
+    log_path: str,
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int,
+    epochs: int,
+    output_path: str,
+):
+    """
+    For each architecture in `log_path` (EA / random / BO-style JSONL),
+    run full training for `epochs` and log:
+
+      - val_loss_short, ppl_short  (if present in original log)
+      - val_loss_full,  ppl_full   (new full-run numbers)
+
+    Writes one JSON line per architecture to `output_path`.
+    """
+    from copy import deepcopy
+
+    with open(log_path, "r") as f:
+        records = [json.loads(line) for line in f]
+
+    print(f"[full_eval_from_log] Loaded {len(records)} candidates from {log_path}")
+
+    with open(output_path, "w") as out_f:
+        for i, rec in enumerate(records):
+            cfg_dict = rec["config"]
+            cfg = EvoConfig(**cfg_dict)
+
+            print(
+                f"\n[full_eval_from_log] ({i+1}/{len(records)}) "
+                f"arch_id={rec.get('arch_id')} search_type={rec.get('search_type')} "
+                f"val_loss_short={rec.get('val_loss')}"
+            )
+
+            best_val_loss, best_ppl, _ = train_full(
+                cfg,
+                lm_datasets,
+                tokenizer,
+                vocab_size,
+                block_size=block_size,
+                epochs=epochs,
+            )
+
+            out_rec = {
+                "arch_id": rec.get("arch_id"),
+                "search_type": rec.get("search_type"),
+                "generation": rec.get("generation"),
+                "index": rec.get("index", rec.get("candidate", rec.get("trial"))),
+                "config": deepcopy(cfg_dict),
+                "val_loss_short": rec.get("val_loss"),
+                "perplexity_short": rec.get("perplexity"),
+                "val_loss_full": float(best_val_loss),
+                "perplexity_full": float(best_ppl),
+            }
+            out_f.write(json.dumps(out_rec) + "\n")
+            out_f.flush()
+
+    print(f"[full_eval_from_log] Wrote full-run metrics to {output_path}")
+
+
+def sample_neighbors_from_log(
+    log_path: str,
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int,
+    max_train_steps: int,
+    max_eval_batches: int,
+    num_neighbors: int,
+    output_path: str,
+):
+    """
+    Take the *best* architecture in `log_path` (by short-run val_loss),
+    generate `num_neighbors` 1-step EA mutations using `mutate(cfg)`,
+    and short-train all of them to get neighbor losses.
+
+    This gives you local neighborhood data around x* for Δ(x*) / κ(D) proxies.
+    """
+    with open(log_path, "r") as f:
+        records = [json.loads(line) for line in f]
+
+    if not records:
+        raise ValueError(f"No records in {log_path}")
+
+    # pick best by short-run val_loss
+    best_rec = min(
+        records,
+        key=lambda r: float("inf") if r.get("val_loss") is None else r["val_loss"],
+    )
+    base_cfg = EvoConfig(**best_rec["config"])
+    base_arch_id = best_rec.get("arch_id")
+
+    print(
+        f"[neighbors] Using best candidate arch_id={base_arch_id}, "
+        f"val_loss={best_rec.get('val_loss')}, search_type={best_rec.get('search_type')}"
+    )
+
+    neighbors = []
+    for _ in range(num_neighbors):
+        # single EA-style mutation step
+        nbr_cfg = mutate(base_cfg)
+        neighbors.append(nbr_cfg)
+
+    with open(output_path, "w") as out_f:
+        for i, cfg in enumerate(neighbors):
+            (
+                fitness,
+                val_loss,
+                ppl,
+                train_time,
+                tps,
+                num_params,
+            ) = train_and_eval_short(
+                cfg,
+                lm_datasets,
+                tokenizer,
+                vocab_size,
+                block_size,
+                max_train_steps=max_train_steps,
+                max_eval_batches=max_eval_batches,
+            )
+
+            rec = {
+                "search_type": "neighbor",
+                "origin_arch_id": base_arch_id,
+                "neighbor_index": i,
+                "config": cfg.__dict__,
+                "fitness": float(fitness),
+                "val_loss": float(val_loss),
+                "perplexity": float(ppl),
+                "train_time": float(train_time),
+                "tokens_per_second": float(tps),
+                "num_params": int(num_params),
+            }
+            out_f.write(json.dumps(rec) + "\n")
+            out_f.flush()
+
+            print(
+                f"[neighbors] neighbor {i}: val_loss={val_loss:.4f}, "
+                f"ppl={ppl:.2f}, params={num_params}"
+            )
+
+    print(f"[neighbors] Wrote neighbor evaluations to {output_path}")
+
+
+def repeat_eval_from_log(
+    log_path: str,
+    lm_datasets,
+    tokenizer,
+    vocab_size: int,
+    block_size: int,
+    max_train_steps: int,
+    max_eval_batches: int,
+    target_arch_id: int | None,
+    n_runs: int,
+    output_path: str,
+):
+    """
+    Re-evaluate the SAME architecture n_runs times with the short-run
+    training budget, to estimate evaluation noise / variance σ².
+
+    If target_arch_id is None, we use the best val_loss in the log.
+    """
+    with open(log_path, "r") as f:
+        records = [json.loads(line) for line in f]
+
+    if not records:
+        raise ValueError(f"No records in {log_path}")
+
+    if target_arch_id is not None:
+        candidates = [r for r in records if r.get("arch_id") == target_arch_id]
+        if not candidates:
+            raise ValueError(f"arch_id={target_arch_id} not found in {log_path}")
+        base_rec = candidates[0]
+    else:
+        base_rec = min(
+            records,
+            key=lambda r: float("inf") if r.get("val_loss") is None else r["val_loss"],
+        )
+
+    cfg = EvoConfig(**base_rec["config"])
+    arch_id = base_rec.get("arch_id")
+
+    print(
+        f"[repeat_eval] Repeating short-run eval for arch_id={arch_id}, "
+        f"val_loss_short={base_rec.get('val_loss')}, n_runs={n_runs}"
+    )
+
+    with open(output_path, "w") as out_f:
+        for i in range(n_runs):
+            (
+                fitness,
+                val_loss,
+                ppl,
+                train_time,
+                tps,
+                num_params,
+            ) = train_and_eval_short(
+                cfg,
+                lm_datasets,
+                tokenizer,
+                vocab_size,
+                block_size,
+                max_train_steps=max_train_steps,
+                max_eval_batches=max_eval_batches,
+            )
+
+            rec = {
+                "search_type": "repeat_eval",
+                "arch_id": arch_id,
+                "run_index": i,
+                "config": cfg.__dict__,
+                "fitness": float(fitness),
+                "val_loss": float(val_loss),
+                "perplexity": float(ppl),
+                "train_time": float(train_time),
+                "tokens_per_second": float(tps),
+                "num_params": int(num_params),
+            }
+            out_f.write(json.dumps(rec) + "\n")
+            out_f.flush()
+
+            print(
+                f"[repeat_eval] run {i}: val_loss={val_loss:.4f}, "
+                f"ppl={ppl:.2f}, params={num_params}"
+            )
+
+    print(f"[repeat_eval] Wrote repeated evals to {output_path}")
 
 # -----------------------------
 # Full training for a given config
@@ -1358,9 +1645,22 @@ def main():
         "--mode",
         type=str,
         default="ea",
-        choices=["ea", "random", "train_best", "train_manual"],
-        help="ea = evolutionary search; random = random search baseline; "
-             "train_best = train evolved config; train_manual = train baseline config",
+        choices=[
+            "ea",
+            "random",
+            "train_best",
+            "train_manual",
+            "full_eval",
+            "neighbors",
+            "repeat_eval",
+        ],
+        help=(
+            "ea = evolutionary search; random = random search baseline; "
+            "train_best = train evolved config; train_manual = train baseline config; "
+            "full_eval = full training for all configs in a log; "
+            "neighbors = sample neighbors around best config from a log; "
+            "repeat_eval = repeated short evals for one config from a log"
+        ),
     )
     parser.add_argument(
         "--dataset",
@@ -1376,15 +1676,39 @@ def main():
     parser.add_argument("--ea_eval_batches", type=int, default=40)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--config_json", type=str, default="best_config.json")
+
+    # extra args for new modes
+    parser.add_argument(
+        "--log_jsonl",
+        type=str,
+        default="",
+        help="Path to candidate log (.jsonl) for full_eval / neighbors / repeat_eval",
+    )
+    parser.add_argument(
+        "--neighbors_k",
+        type=int,
+        default=16,
+        help="Number of neighbors to sample in 'neighbors' mode",
+    )
+    parser.add_argument(
+        "--repeat_target_arch_id",
+        type=int,
+        default=None,
+        help="arch_id to re-evaluate in 'repeat_eval' mode (default: best in log)",
+    )
+    parser.add_argument(
+        "--repeat_runs",
+        type=int,
+        default=5,
+        help="Number of repeated runs in 'repeat_eval' mode",
+    )
+
     args = parser.parse_args()
 
     random.seed(0)
     torch.manual_seed(0)
 
-    # base_dir = "data/wikitext2"
-    # print(f"Loading WikiText-2 from {base_dir} ...")
-    # raw_datasets = load_wikitext2(base_dir)
-    # Choose dataset
+    # ---------------- Dataset ----------------
     if args.dataset == "wt2":
         base_dir = "data/wikitext2"
         print(f"Loading WikiText-2 from {base_dir} ...")
@@ -1406,11 +1730,14 @@ def main():
     random_log_path = f"random_candidates_{log_suffix}.jsonl"
 
     print("Tokenizing + grouping dataset...")
-    lm_datasets = tokenize_wikitext2(raw_datasets, tokenizer, block_size=args.block_size)
+    lm_datasets = tokenize_wikitext2(
+        raw_datasets, tokenizer, block_size=args.block_size
+    )
 
     vocab_size = len(tokenizer)
     print(f"Vocab size: {vocab_size}")
 
+    # ---------------- Modes ----------------
     if args.mode == "ea":
         print("Running evolutionary search (short training)...")
         history, global_best = evolutionary_search(
@@ -1458,7 +1785,6 @@ def main():
             block_size=args.block_size,
             epochs=args.epochs,
         )
-        # Save evolved model checkpoint
         torch.save(
             {
                 "config": cfg.__dict__,
@@ -1490,7 +1816,6 @@ def main():
             block_size=args.block_size,
             epochs=args.epochs,
         )
-        # Save baseline model checkpoint
         torch.save(
             {
                 "config": cfg.__dict__,
@@ -1500,6 +1825,57 @@ def main():
         )
         print(f"\nFinal baseline val_loss={best_val_loss:.4f}, ppl={best_ppl:.2f}")
         print("Saved baseline model to baseline_model.pt")
+
+    elif args.mode == "full_eval":
+        if not args.log_jsonl:
+            raise ValueError("--log_jsonl is required for mode=full_eval")
+        out_path = args.log_jsonl.replace(".jsonl", "_full_eval.jsonl")
+        full_eval_from_log(
+            args.log_jsonl,
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            epochs=args.epochs,
+            output_path=out_path,
+        )
+
+    elif args.mode == "neighbors":
+        if not args.log_jsonl:
+            raise ValueError("--log_jsonl is required for mode=neighbors")
+        out_path = args.log_jsonl.replace(".jsonl", "_neighbors.jsonl")
+        sample_neighbors_from_log(
+            args.log_jsonl,
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            max_train_steps=args.ea_train_steps,
+            max_eval_batches=args.ea_eval_batches,
+            num_neighbors=args.neighbors_k,
+            output_path=out_path,
+        )
+
+    elif args.mode == "repeat_eval":
+        if not args.log_jsonl:
+            raise ValueError("--log_jsonl is required for mode=repeat_eval")
+        out_path = args.log_jsonl.replace(".jsonl", "_repeats.jsonl")
+        repeat_eval_from_log(
+            args.log_jsonl,
+            lm_datasets,
+            tokenizer,
+            vocab_size,
+            block_size=args.block_size,
+            max_train_steps=args.ea_train_steps,
+            max_eval_batches=args.ea_eval_batches,
+            target_arch_id=args.repeat_target_arch_id,
+            n_runs=args.repeat_runs,
+            output_path=out_path,
+        )
+
+    else:
+        raise ValueError(f"Unknown mode: {args.mode}")
+
 
 
 if __name__ == "__main__":
