@@ -1,14 +1,14 @@
 {
   "config": {
-    "d_model": 256,
+    "d_model": 192,
     "n_heads": 2,
-    "n_layers": 4,
-    "d_ff": 384,
-    "dropout": 0.1,
-    "attention_type": "full",
-    "chunk_size": 32,
+    "n_layers": 3,
+    "d_ff": 512,
+    "dropout": 0.2,
+    "attention_type": "hybrid",
+    "chunk_size": 16,
     "batch_size": 16
   },
-  "val_loss": 6.024454300046906,
-  "perplexity": 413.4159793760268
+  "val_loss": 6.195689644400529,
+  "perplexity": 490.6296883681052
 }
