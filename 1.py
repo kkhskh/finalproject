@@ -20,6 +20,7 @@ Example usage:
 """
 
 import math
+import copy
 import random
 import time
 from dataclasses import dataclass
@@ -468,6 +469,77 @@ def crossover(a: EvoConfig, b: EvoConfig) -> EvoConfig:
     )
 
 
+def hamming_neighbors(cfg: EvoConfig) -> list[EvoConfig]:
+    """
+    Generate all Hamming-1 neighbors within the discrete search space.
+    Keeps n_heads compatible with d_model.
+    """
+    neighbors = []
+
+    # d_model
+    for dm in D_MODEL_CHOICES:
+        if dm != cfg.d_model:
+            new = copy.deepcopy(cfg)
+            new.d_model = dm
+            valid_heads = [h for h in N_HEAD_CHOICES if dm % h == 0]
+            if not valid_heads:
+                continue
+            if new.n_heads not in valid_heads:
+                new.n_heads = random.choice(valid_heads)
+            neighbors.append(new)
+
+    # n_heads (compatible with current d_model)
+    for h in N_HEAD_CHOICES:
+        if h != cfg.n_heads and cfg.d_model % h == 0:
+            new = copy.deepcopy(cfg)
+            new.n_heads = h
+            neighbors.append(new)
+
+    # n_layers
+    for nl in N_LAYER_CHOICES:
+        if nl != cfg.n_layers:
+            new = copy.deepcopy(cfg)
+            new.n_layers = nl
+            neighbors.append(new)
+
+    # d_ff
+    for ff in D_FF_CHOICES:
+        if ff != cfg.d_ff:
+            new = copy.deepcopy(cfg)
+            new.d_ff = ff
+            neighbors.append(new)
+
+    # dropout
+    for dr in DROPOUT_CHOICES:
+        if dr != cfg.dropout:
+            new = copy.deepcopy(cfg)
+            new.dropout = dr
+            neighbors.append(new)
+
+    # attention_type
+    for attn in ATTN_TYPE_CHOICES:
+        if attn != cfg.attention_type:
+            new = copy.deepcopy(cfg)
+            new.attention_type = attn
+            neighbors.append(new)
+
+    # chunk_size
+    for cs in CHUNK_CHOICES:
+        if cs != cfg.chunk_size:
+            new = copy.deepcopy(cfg)
+            new.chunk_size = cs
+            neighbors.append(new)
+
+    # batch_size
+    for bs in BATCH_CHOICES:
+        if bs != cfg.batch_size:
+            new = copy.deepcopy(cfg)
+            new.batch_size = bs
+            neighbors.append(new)
+
+    return neighbors
+
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -881,6 +953,9 @@ def evolutionary_search(
 
     history = []
     global_best = None
+    loss_by_arch_id = {}
+    improve_transitions = 0
+    total_transitions = 0
 
     # overwrite log file each run
     with open(log_path, "w") as f_log:
@@ -915,6 +990,19 @@ def evolutionary_search(
                 scored.append(
                     (fitness, cfg, val_loss, ppl, train_time, tps, num_params)
                 )
+
+                # lineage-aware improvement counting
+                loss_by_arch_id[meta["arch_id"]] = float(val_loss)
+                if meta["parent_ids"]:
+                    parent_losses = [
+                        loss_by_arch_id[p]
+                        for p in meta["parent_ids"]
+                        if p in loss_by_arch_id
+                    ]
+                    if parent_losses:
+                        total_transitions += 1
+                        if val_loss < min(parent_losses):
+                            improve_transitions += 1
 
                 rec = {
                     "search_type": "ea",
@@ -1045,6 +1133,15 @@ def evolutionary_search(
     # attach total EA runtime to global_best for convenience
     if global_best is not None:
         global_best["ea_total_time"] = float(total_ea_time)
+
+    if total_transitions > 0:
+        alpha_min_hat = improve_transitions / total_transitions
+        print(
+            f"\n[EA] alpha_min proxy (P(child improves over best parent)): "
+            f"{alpha_min_hat:.4f} ({improve_transitions}/{total_transitions})"
+        )
+    else:
+        print("\n[EA] alpha_min proxy: N/A (no parent losses recorded)")
 
     return history, global_best
 
@@ -1347,12 +1444,16 @@ def sample_neighbors_from_log(
         f"val_loss={best_rec.get('val_loss')}, search_type={best_rec.get('search_type')}"
     )
 
-    neighbors = []
-    for _ in range(num_neighbors):
-        # single EA-style mutation step
-        nbr_cfg = mutate(base_cfg)
-        neighbors.append(nbr_cfg)
+    neighbors = hamming_neighbors(base_cfg)
+    if not neighbors:
+        print("[neighbors] No Hamming-1 neighbors generated (check search space).")
+        return
 
+    if num_neighbors < len(neighbors):
+        neighbors = random.sample(neighbors, num_neighbors)
+
+    best_loss = best_rec.get("val_loss", float("inf"))
+    neighbor_losses = []
     with open(output_path, "w") as out_f:
         for i, cfg in enumerate(neighbors):
             (
@@ -1374,6 +1475,7 @@ def sample_neighbors_from_log(
 
             rec = {
                 "search_type": "neighbor",
+                "probe": "hamming1",
                 "origin_arch_id": base_arch_id,
                 "neighbor_index": i,
                 "config": cfg.__dict__,
@@ -1386,11 +1488,20 @@ def sample_neighbors_from_log(
             }
             out_f.write(json.dumps(rec) + "\n")
             out_f.flush()
+            neighbor_losses.append(float(val_loss))
 
             print(
                 f"[neighbors] neighbor {i}: val_loss={val_loss:.4f}, "
                 f"ppl={ppl:.2f}, params={num_params}"
             )
+
+    # simple valley-depth proxy
+    if neighbor_losses and best_loss is not None:
+        delta_hat = min(neighbor_losses) - best_loss
+        try:
+            print(f"[neighbors] valley-depth proxy Δ̂(x*): {delta_hat:.4f}")
+        except Exception:
+            pass
 
     print(f"[neighbors] Wrote neighbor evaluations to {output_path}")
 
