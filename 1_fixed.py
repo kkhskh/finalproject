@@ -1487,7 +1487,7 @@ def full_eval_from_log(
                 f"val_loss_short={rec.get('val_loss')}"
             )
 
-            best_val_loss, best_ppl, _ = train_full(
+            best_val_loss, best_ppl, _, test_ppl = train_full(
                 cfg,
                 lm_datasets,
                 tokenizer,
@@ -1506,6 +1506,7 @@ def full_eval_from_log(
                 "perplexity_short": rec.get("perplexity"),
                 "val_loss_full": float(best_val_loss),
                 "perplexity_full": float(best_ppl),
+                "test_ppl_full": float(test_ppl),
             }
             out_f.write(json.dumps(out_rec) + "\n")
             out_f.flush()
@@ -2049,7 +2050,7 @@ def main():
             batch_size=16,
         )
         print(f"Manual baseline config: {cfg}")
-        best_val_loss, best_ppl, best_state = train_full(
+        best_val_loss, best_ppl, best_state, test_ppl = train_full(
             cfg,
             lm_datasets,
             tokenizer,
@@ -2064,7 +2065,10 @@ def main():
             },
             "baseline_model.pt",
         )
-        print(f"\nFinal baseline val_loss={best_val_loss:.4f}, ppl={best_ppl:.2f}")
+        print(
+            f"\nFinal baseline val_loss={best_val_loss:.4f}, "
+            f"val_ppl={best_ppl:.2f} | test_ppl={test_ppl:.2f}"
+        )
         print("Saved baseline model to baseline_model.pt")
 
     elif args.mode == "full_eval":
