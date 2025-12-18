@@ -1670,7 +1670,13 @@ def train_full(
     model = EvoTransformerLM(
         vocab_size=vocab_size, block_size=block_size, config=config
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=lr,
+    betas=(0.9, 0.95),
+    weight_decay=0.01,
+    )
+
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     pad_token_id = tokenizer.pad_token_id
