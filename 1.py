@@ -202,8 +202,10 @@ class EvoMultiheadSelfAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         if self.attention_type == "hybrid":
-            # Learned scalar gate per layer: sigma(g) ~ how much to trust full attention
-            self.hybrid_gate = nn.Parameter(torch.tensor(0.0))
+            # Learned scalar controlling how much *extra local* attention to add.
+            # Start near "almost full attention" (sigmoid(-2) ≈ 0.12).
+            self.hybrid_gate = nn.Parameter(torch.tensor(-2.0))
+
 
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
@@ -228,8 +230,9 @@ class EvoMultiheadSelfAttention(nn.Module):
         else:  # 'hybrid'
             full_out = self._full_attention(q, k, v, causal)
             chunk_out = self._chunked_attention(q, k, v, causal)
-            gate = torch.sigmoid(self.hybrid_gate)  # scalar in (0,1)
-            out = gate * full_out + (1.0 - gate) * chunk_out
+            chunk_scale = torch.sigmoid(self.hybrid_gate)  # scalar in (0,1)
+            out = full_out + chunk_scale * chunk_out
+
 
 
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
@@ -251,31 +254,46 @@ class EvoMultiheadSelfAttention(nn.Module):
         return out
 
     def _chunked_attention(self, q, k, v, causal: bool):
+        """
+        Sliding-window causal attention (window = self.chunk_size), computed in chunks
+        for speed. Unlike the old hard partition, tokens can attend across chunk
+        boundaries within the window.
+        """
         B, H, T, D = q.size()
-        chunk_size = min(self.chunk_size, T)
+        window = min(self.chunk_size, T)
+        step = window  # compute in blocks, but allow overlap via masking
         outputs = []
-        for start in range(0, T, chunk_size):
-            end = min(start + chunk_size, T)
-            q_chunk = q[:, :, start:end, :]
-            k_chunk = k[:, :, start:end, :]
-            v_chunk = v[:, :, start:end, :]
-            Tc = end - start
+
+        for start in range(0, T, step):
+            end = min(start + step, T)
+
+            # Provide keys/values that include up to `window-1` tokens before `start`
+            k_start = max(0, start - (window - 1))
+
+            q_chunk = q[:, :, start:end, :]            # (B,H,Q,D)
+            k_chunk = k[:, :, k_start:end, :]          # (B,H,K,D)
+            v_chunk = v[:, :, k_start:end, :]          # (B,H,K,D)
 
             scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) / math.sqrt(D)
+
             if causal:
-                mask = torch.triu(
-                    torch.ones(Tc, Tc, device=scores.device, dtype=torch.bool),
-                    diagonal=1,
-                )
+                # Build a mask that enforces:
+                # 1) causal: key_pos <= query_pos
+                # 2) window: key_pos >= query_pos - (window-1)
+                q_pos = torch.arange(start, end, device=scores.device)[:, None]          # (Q,1)
+                k_pos = torch.arange(k_start, end, device=scores.device)[None, :]        # (1,K)
+
+                mask = (k_pos > q_pos) | (k_pos < (q_pos - (window - 1)))
                 scores = scores.masked_fill(mask, float("-inf"))
 
             attn = torch.softmax(scores, dim=-1)
             attn = self.dropout(attn)
-            out_chunk = torch.matmul(attn, v_chunk)
+            out_chunk = torch.matmul(attn, v_chunk)  # (B,H,Q,D)
             outputs.append(out_chunk)
 
-        out = torch.cat(outputs, dim=2)  # (B, H, T, D)
+        out = torch.cat(outputs, dim=2)  # (B,H,T,D)
         return out
+
 
 
 class EvoTransformerBlock(nn.Module):
@@ -341,6 +359,9 @@ class EvoTransformerLM(nn.Module):
         )
         self.ln_f = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, vocab_size, bias=False)
+        self.lm_head.weight = self.token_embed.weight
+
+
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
         B, T = idx.size()
@@ -718,17 +739,22 @@ def train_and_eval_short(
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = input_ids[:, 1:].contiguous()
 
+        shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+
         loss = F.cross_entropy(
             shift_logits.view(-1, vocab_size),
             shift_labels.view(-1),
+            ignore_index=-100,
         )
+
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        total_tokens += input_ids.numel()
+        total_tokens += (shift_labels != -100).sum().item()
+
         steps += 1
         if steps >= max_train_steps:
             break
@@ -761,13 +787,17 @@ def train_and_eval_short(
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = input_ids[:, 1:].contiguous()
 
+            shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+
             loss = F.cross_entropy(
                 shift_logits.view(-1, vocab_size),
                 shift_labels.view(-1),
                 reduction="sum",
+                ignore_index=-100,
             )
             total_loss += loss.item()
-            total_eval_tokens += shift_labels.numel()
+            total_eval_tokens += (shift_labels != -100).sum().item()
+
 
             if i + 1 >= max_eval_batches:
                 break
@@ -1655,18 +1685,24 @@ def train_full(
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = input_ids[:, 1:].contiguous()
 
+            shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+
             loss = F.cross_entropy(
                 shift_logits.view(-1, vocab_size),
                 shift_labels.view(-1),
+                ignore_index=-100,
             )
+
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
-            total_loss += loss.item() * shift_labels.numel()
-            total_tokens += shift_labels.numel()
+            n_tokens = (shift_labels != -100).sum().item()
+            total_loss += loss.item() * n_tokens
+            total_tokens += n_tokens
+
 
         scheduler.step()
         train_time = time.perf_counter() - start
@@ -1698,13 +1734,17 @@ def train_full(
                 shift_logits = logits[:, :-1, :].contiguous()
                 shift_labels = input_ids[:, 1:].contiguous()
 
+                shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+
                 loss = F.cross_entropy(
                     shift_logits.view(-1, vocab_size),
                     shift_labels.view(-1),
                     reduction="sum",
+                    ignore_index=-100,
                 )
                 val_loss_total += loss.item()
-                val_tokens += shift_labels.numel()
+                val_tokens += (shift_labels != -100).sum().item()
+
 
         val_loss = val_loss_total / max(val_tokens, 1)
         val_ppl = math.exp(min(val_loss, 20.0))
@@ -1720,7 +1760,8 @@ def train_full(
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            best_state = model.state_dict()
+            best_state = copy.deepcopy(model.state_dict())
+
 
     return best_val_loss, math.exp(min(best_val_loss, 20.0)), best_state
 
@@ -1820,6 +1861,7 @@ def main():
     torch.manual_seed(0)
 
     # ---------------- Dataset ----------------
+    # ---------------- Dataset ----------------
     if args.dataset == "wt2":
         base_dir = "data/wikitext2"
         print(f"Loading WikiText-2 from {base_dir} ...")
@@ -1830,6 +1872,7 @@ def main():
         raw_datasets = load_wikitext103(base_dir)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
+
 
     print("Loading tokenizer (GPT-2)...")
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
