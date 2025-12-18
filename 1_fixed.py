@@ -118,20 +118,67 @@ def tokenize_wikitext2(raw_datasets, tokenizer, block_size: int):
     )
     return lm_datasets
 
+def evaluate_ppl(model, data_loader, vocab_size, block_size, pad_token_id, max_batches=None):
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+
+    with torch.no_grad():
+        for i, batch in enumerate(data_loader):
+            input_ids = batch["input_ids"].to(device)
+            B, T = input_ids.size()
+
+            if T > block_size:
+                input_ids = input_ids[:, :block_size]
+            elif T < block_size:
+                pad_len = block_size - T
+                pad = torch.full((B, pad_len), pad_token_id, device=device, dtype=input_ids.dtype)
+                input_ids = torch.cat([input_ids, pad], dim=1)
+
+            logits = model(input_ids)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            # ignore pad tokens
+            shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+                reduction="sum",
+                ignore_index=-100,
+            )
+
+            total_loss += loss.item()
+            total_tokens += (shift_labels != -100).sum().item()
+
+            if max_batches is not None and (i + 1) >= max_batches:
+                break
+
+    avg_loss = total_loss / max(total_tokens, 1)
+    ppl = math.exp(min(avg_loss, 20.0))
+    return avg_loss, ppl
+
 
 def make_dataloaders(lm_datasets, batch_size: int):
     """
     Create PyTorch dataloaders from grouped LM dataset.
+    Returns: train_loader (shuffled), val_loader, test_loader, train_eval_loader (not shuffled)
     """
     train_ds = lm_datasets["train"]
     val_ds = lm_datasets["validation"]
+    test_ds = lm_datasets["test"]
 
     train_ds.set_format(type="torch", columns=["input_ids"])
     val_ds.set_format(type="torch", columns=["input_ids"])
+    test_ds.set_format(type="torch", columns=["input_ids"])
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    train_eval_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-    return train_loader, val_loader
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    return train_loader, val_loader, test_loader, train_eval_loader
+
 
 
 # -----------------------------
@@ -706,7 +753,9 @@ def train_and_eval_short(
     Train a candidate model for a small number of steps and return:
       fitness, val_loss, perplexity, train_time, tokens_per_second, num_params
     """
-    train_loader, val_loader = make_dataloaders(lm_datasets, config.batch_size)
+    train_loader, val_loader, _test_loader, _train_eval_loader = make_dataloaders(
+        lm_datasets, config.batch_size
+    )
 
     model = EvoTransformerLM(
         vocab_size=vocab_size,
@@ -1665,18 +1714,14 @@ def train_full(
     Train a given config for multiple epochs over the full training set.
     Returns (best_val_loss, best_val_ppl, best_state_dict).
     """
-    train_loader, val_loader = make_dataloaders(lm_datasets, config.batch_size)
+    train_loader, val_loader, test_loader, train_eval_loader = make_dataloaders(
+        lm_datasets, config.batch_size
+    )
 
     model = EvoTransformerLM(
         vocab_size=vocab_size, block_size=block_size, config=config
     ).to(device)
-    optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=lr,
-    betas=(0.9, 0.95),
-    weight_decay=0.01,
-    )
-
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     pad_token_id = tokenizer.pad_token_id
@@ -1795,7 +1840,18 @@ def train_full(
             best_val_loss = val_loss
             best_state = copy.deepcopy(model.state_dict())
 
-    return best_val_loss, math.exp(min(best_val_loss, 20.0)), best_state
+    best_val_ppl = math.exp(min(best_val_loss, 20.0))
+
+    # Evaluate test PPL using best-val checkpoint
+    if best_state is not None:
+        model.load_state_dict(best_state)
+        test_loss, test_ppl = evaluate_ppl(
+            model, test_loader, vocab_size, block_size, pad_token_id
+        )
+    else:
+        test_ppl = float("nan")
+
+    return best_val_loss, best_val_ppl, best_state, test_ppl
 
 
 # -----------------------------
@@ -1960,7 +2016,7 @@ def main():
         print(f"Loading best config from {args.config_json}")
         cfg = load_config_from_json(args.config_json)
         print(f"Best config: {cfg}")
-        best_val_loss, best_ppl, best_state = train_full(
+        best_val_loss, best_ppl, best_state, test_ppl = train_full(
             cfg,
             lm_datasets,
             tokenizer,
@@ -1976,7 +2032,9 @@ def main():
             "evolved_best_model.pt",
         )
         print(f"\nFinal best val_loss={best_val_loss:.4f}, ppl={best_ppl:.2f}")
+        print(f"Final best val_ppl={best_ppl:.2f} | test_ppl={test_ppl:.2f}")
         print("Saved evolved model to evolved_best_model.pt")
+        
 
     elif args.mode == "train_manual":
         print("Training manual baseline config...")
