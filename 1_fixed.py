@@ -1881,6 +1881,8 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     if tokenizer.pad_token is None:
         tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
+    vocab_size = len(tokenizer)
+    print(f"Vocab size (after adding pad): {vocab_size}")
 
     log_suffix = args.dataset
     ea_log_path = f"ea_candidates_{log_suffix}.jsonl"
@@ -1890,9 +1892,6 @@ def main():
     lm_datasets = tokenize_wikitext2(
         raw_datasets, tokenizer, block_size=args.block_size
     )
-
-    vocab_size = len(tokenizer)
-    print(f"Vocab size: {vocab_size}")
 
     # ---------------- Modes ----------------
     if args.mode == "ea":
