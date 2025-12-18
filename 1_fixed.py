@@ -1137,11 +1137,11 @@ def evolutionary_search(
             new_population_meta = []
 
             while len(new_population) < pop_size:
-            if len(parents_cfgs) >= 2:
-                a, b = random.sample(parents_cfgs, 2)
-            else:
-                # degenerate case: reuse the single parent twice
-                a = b = parents_cfgs[0]
+                if len(parents_cfgs) >= 2:
+                    a, b = random.sample(parents_cfgs, 2)
+                else:
+                    # degenerate case: reuse the single parent twice
+                    a = b = parents_cfgs[0]
                 meta_a = cfg_to_meta[id(a)]
                 meta_b = cfg_to_meta[id(b)]
 
