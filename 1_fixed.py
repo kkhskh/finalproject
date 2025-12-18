@@ -359,7 +359,22 @@ class EvoTransformerLM(nn.Module):
         )
         self.ln_f = nn.LayerNorm(config.d_model)
         self.lm_head = nn.Linear(config.d_model, vocab_size, bias=False)
+
+        # GPT-style small init to avoid huge logits when tying weights
+        self.apply(self._init_weights)
+        # tie AFTER init so the shared weights are already small
         self.lm_head.weight = self.token_embed.weight
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
 
     def forward(self, idx: torch.Tensor) -> torch.Tensor:
@@ -713,53 +728,59 @@ def train_and_eval_short(
     if pad_token_id is None:
         pad_token_id = tokenizer.eos_token_id
 
-    model.train()
-    start_time = time.perf_counter()
     total_tokens = 0
     steps = 0
 
-    for batch in train_loader:
-        input_ids = batch["input_ids"].to(device)
-        B, T = input_ids.size()
+    if max_train_steps > 0:
+        model.train()
+        start_time = time.perf_counter()
 
-        if T > block_size:
-            input_ids = input_ids[:, :block_size]
-        elif T < block_size:
-            pad_len = block_size - T
-            pad = torch.full(
-                (B, pad_len),
-                pad_token_id,
-                device=device,
-                dtype=input_ids.dtype,
+        for batch in train_loader:
+            input_ids = batch["input_ids"].to(device)
+            B, T = input_ids.size()
+
+            if T > block_size:
+                input_ids = input_ids[:, :block_size]
+            elif T < block_size:
+                pad_len = block_size - T
+                pad = torch.full(
+                    (B, pad_len),
+                    pad_token_id,
+                    device=device,
+                    dtype=input_ids.dtype,
+                )
+                input_ids = torch.cat([input_ids, pad], dim=1)
+
+            logits = model(input_ids)
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = input_ids[:, 1:].contiguous()
+
+            shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+
+            loss = F.cross_entropy(
+                shift_logits.view(-1, vocab_size),
+                shift_labels.view(-1),
+                ignore_index=-100,
             )
-            input_ids = torch.cat([input_ids, pad], dim=1)
 
-        logits = model(input_ids)
-        shift_logits = logits[:, :-1, :].contiguous()
-        shift_labels = input_ids[:, 1:].contiguous()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
 
-        shift_labels = shift_labels.masked_fill(shift_labels == pad_token_id, -100)
+            total_tokens += (shift_labels != -100).sum().item()
 
-        loss = F.cross_entropy(
-            shift_logits.view(-1, vocab_size),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
+            steps += 1
+            if steps >= max_train_steps:
+                break
 
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-
-        total_tokens += (shift_labels != -100).sum().item()
-
-        steps += 1
-        if steps >= max_train_steps:
-            break
-
-    train_time = time.perf_counter() - start_time
-    tokens_per_second = total_tokens / max(train_time, 1e-6)
+        train_time = time.perf_counter() - start_time
+        tokens_per_second = total_tokens / max(train_time, 1e-6)
+    else:
+        # skip training; evaluate init weights directly
+        train_time = 0.0
+        tokens_per_second = 0.0
+        model.eval()
 
     # Validation
     model.eval()
