@@ -1128,13 +1128,20 @@ def evolutionary_search(
                 parents_cfgs = [
                     cfg for (_, cfg, *_rest) in scored[: max(2, pop_size // 2)]
                 ]
+            # ensure we have at least 2 parents (allow sampling with replacement)
+            if len(parents_cfgs) == 1:
+                parents_cfgs = parents_cfgs * 2
 
             # ---------- Reproduce next generation + lineage meta ----------
             new_population = []
             new_population_meta = []
 
             while len(new_population) < pop_size:
+            if len(parents_cfgs) >= 2:
                 a, b = random.sample(parents_cfgs, 2)
+            else:
+                # degenerate case: reuse the single parent twice
+                a = b = parents_cfgs[0]
                 meta_a = cfg_to_meta[id(a)]
                 meta_b = cfg_to_meta[id(b)]
 
