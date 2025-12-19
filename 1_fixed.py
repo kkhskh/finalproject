@@ -1722,7 +1722,22 @@ def train_full(
     model = EvoTransformerLM(
         vocab_size=vocab_size, block_size=block_size, config=config
     ).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    # GPT-style AdamW: decay only multi-dim params, lower beta2
+    decay, nodecay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        (decay if p.dim() >= 2 else nodecay).append(p)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": 0.1},
+            {"params": nodecay, "weight_decay": 0.0},
+        ],
+        lr=lr,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     pad_token_id = tokenizer.pad_token_id
